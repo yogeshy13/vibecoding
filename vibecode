@@ -1,0 +1,248 @@
+# Terraform EKS + Kubernetes Demo (Vibe-coded in 45 mins with Claude)
+# Deploys EKS cluster (3 nodes t3.medium), nginx ingress, sample app with HPA autoscaling
+# Berlin region (eu-central-1), portfolio-ready for SRE/Cloud Architect roles
+
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.40"
+    }
+    kubernetes = {
+      source  = "hashicorp/kubernetes"
+      version = "~> 2.30"
+    }
+    helm = {
+      source  = "hashicorp/helm"
+      version = "~> 2.13"
+    }
+  }
+}
+
+provider "aws" {
+  region = "eu-central-1"  # Frankfurt/Berlin low-latency
+}
+
+# VPC (multi-AZ)
+module "vpc" {
+  source  = "terraform-aws-modules/vpc/aws"
+  version = "~> 5.0"
+
+  name = "eks-demo-vpc"
+  cidr = "10.0.0.0/16"
+
+  azs             = ["eu-central-1a", "eu-central-1b", "eu-central-1c"]
+  private_subnets = ["10.0.1.0/24", "10.0.2.0/24", "10.0.3.0/24"]
+  public_subnets  = ["10.0.101.0/24", "10.0.102.0/24", "10.0.103.0/24"]
+
+  enable_nat_gateway = true
+  single_nat_gateway = true
+  enable_vpn_gateway = false
+
+  tags = { Environment = "demo", Owner = "yogeshy13" }
+}
+
+# EKS Cluster (1.30, 3 nodes t3.medium ~4GB RAM)
+module "eks" {
+  source  = "terraform-aws-modules/eks/aws"
+  version = "~> 20.0"
+
+  cluster_name    = "eks-demo-cluster"
+  cluster_version = "1.30"
+
+  vpc_id                         = module.vpc.vpc_id
+  subnet_ids                     = module.vpc.private_subnets
+  eks_managed_node_groups = {
+    demo = {
+      min_size     = 1
+      max_size     = 3
+      desired_size = 2
+
+      instance_types = ["t3.medium"]
+      capacity_type  = "ON_DEMAND"
+
+      labels = { role = "eks-demo" }
+    }
+  }
+
+  tags = { Environment = "demo", Owner = "yogeshy13" }
+}
+
+# Data sources for kubeconfig
+data "aws_eks_cluster" "cluster" {
+  name = module.eks.cluster_id
+}
+
+data "aws_eks_cluster_auth" "cluster" {
+  name = module.eks.cluster_id
+}
+
+provider "kubernetes" {
+  host                   = data.aws_eks_cluster.cluster.endpoint
+  cluster_ca_certificate = base64decode(data.aws_eks_cluster.cluster.certificate_authority[0].data)
+  token                  = data.aws_eks_cluster_auth.cluster.token
+}
+
+provider "helm" {
+  kubernetes {
+    host                   = data.aws_eks_cluster.cluster.endpoint
+    cluster_ca_certificate = base64decode(data.aws_eks_cluster.cluster.certificate_authority[0].data)
+    token                  = data.aws_eks_cluster_auth.cluster.token
+  }
+}
+
+# Ingress NGINX (Load Balancer)
+resource "helm_release" "nginx_ingress" {
+  name       = "nginx-ingress"
+  repository = "https://kubernetes.github.io/ingress-nginx"
+  chart      = "ingress-nginx"
+  version    = "4.11.3"
+
+  set {
+    name  = "controller.service.type"
+    value = "LoadBalancer"
+  }
+}
+
+# Sample App: nginx with HPA (autoscaling demo)
+resource "kubernetes_namespace" "app" {
+  metadata {
+    name = "demo-app"
+  }
+}
+
+resource "kubernetes_deployment" "nginx" {
+  metadata {
+    name      = "demo-nginx"
+    namespace = kubernetes_namespace.app.metadata[0].name
+    labels = {
+      app = "demo-nginx"
+    }
+  }
+  spec {
+    replicas = 2
+    selector {
+      match_labels = {
+        app = "demo-nginx"
+      }
+    }
+    template {
+      metadata {
+        labels = {
+          app = "demo-nginx"
+        }
+      }
+      spec {
+        container {
+          name  = "nginx"
+          image = "nginx:1.27-alpine"
+          port {
+            container_port = 80
+          }
+          resources {
+            requests = {
+              cpu    = "100m"
+              memory = "128Mi"
+            }
+            limits = {
+              cpu    = "500m"
+              memory = "512Mi"
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+resource "kubernetes_service" "nginx" {
+  metadata {
+    name      = "demo-nginx-service"
+    namespace = kubernetes_namespace.app.metadata[0].name
+  }
+  spec {
+    selector = {
+      app = "demo-nginx"
+    }
+    port {
+      port        = 80
+      target_port = 80
+    }
+    type = "ClusterIP"
+  }
+}
+
+# HPA: Autoscaling on CPU >50%
+resource "kubernetes_horizontal_pod_autoscaler_v2" "nginx_hpa" {
+  metadata {
+    name      = "demo-nginx-hpa"
+    namespace = kubernetes_namespace.app.metadata[0].name
+  }
+  spec {
+    scale_target_ref {
+      api_version = "apps/v1"
+      kind        = "Deployment"
+      name        = kubernetes_deployment.nginx.metadata[0].name
+    }
+    min_replicas = 2
+    max_replicas = 10
+    metrics {
+      type = "Resource"
+      resource {
+        name = "cpu"
+        target {
+          type = "Utilization"
+          average_utilization = 50
+        }
+      }
+    }
+  }
+}
+
+# Ingress: External access
+resource "kubernetes_ingress_v1" "nginx" {
+  metadata {
+    name      = "demo-nginx-ingress"
+    namespace = kubernetes_namespace.app.metadata[0].name
+    annotations = {
+      "kubernetes.io/ingress.class"               = "nginx"
+      "nginx.ingress.kubernetes.io/rewrite-target" = "/"
+    }
+  }
+
+  spec {
+    ingress_class_name = "nginx"
+    rule {
+      http {
+        path {
+          backend {
+            service {
+              name = kubernetes_service.nginx.metadata[0].name
+              port {
+                number = 80
+              }
+            }
+          }
+          path      = "/"
+          path_type = "Prefix"
+        }
+      }
+    }
+  }
+
+  depends_on = [helm_release.nginx_ingress]
+}
+
+# Outputs
+output "eks_cluster_endpoint" {
+  value = data.aws_eks_cluster.cluster.endpoint
+}
+
+output "ingress_lb_dns" {
+  value = kubernetes_ingress_v1.nginx.status[0].load_balancer[0].ingress[0].hostname
+}
+
+output "kubeconfig" {
+  sensitive = true
+  value     = module.eks.kubeconfig
+}
